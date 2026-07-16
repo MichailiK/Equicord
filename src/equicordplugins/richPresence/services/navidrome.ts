@@ -38,7 +38,9 @@ interface NdTrack {
     album?: string;
     year?: number;
     suffix?: string;
+    bitDepth?: number;
     bitRate?: number;
+    samplingRate?: number;
     duration?: number;
     minutesAgo?: number;
     coverArt?: string;
@@ -50,12 +52,26 @@ interface NdTrack {
 
 function customFormat(formatStr: string | undefined, track: NdTrack): string {
     if (!formatStr) return "";
+
+    const numberFmt = new Intl.NumberFormat("en-US", { maximumFractionDigits: 1 });
+    const qualityStrings: string[] = [];
+    if (track.suffix)
+        qualityStrings.push(track.suffix.toUpperCase());
+    if (track.bitDepth && track.samplingRate) {
+        qualityStrings.push(`${track.bitDepth.toFixed()}/${(numberFmt.format(track.samplingRate / 1000))}`);
+    }
+    if (track.bitRate) {
+        if (track.bitRate >= 2048)
+            qualityStrings.push(`${(track.bitRate / 1024).toFixed(1)} Mb/s`);
+        else
+            qualityStrings.push(`${track.bitRate} kb/s`);
+    }
     return formatStr
         .replaceAll("{song}", track.title ?? "")
         .replaceAll("{artist}", track.artist ?? "")
         .replaceAll("{album}", track.album ?? "")
         .replaceAll("{year}", track.year ? `${track.year}` : "")
-        .replaceAll("{quality}", track.suffix ? `${track.suffix.toUpperCase()}${track.bitRate ? " " + track.bitRate + "kbps" : ""}` : "");
+        .replaceAll("{quality}", qualityStrings.join(" · "));
 }
 
 async function getAsset(applicationId: string, key: string): Promise<string> {

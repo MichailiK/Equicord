@@ -5,8 +5,8 @@
  */
 
 import { Logger } from "@utils/Logger";
-import { formatDurationMs } from "@utils/text";
 import { Activity } from "@vencord/discord-types";
+import { ActivityStatusDisplayType } from "@vencord/discord-types/enums";
 import { ApplicationAssetUtils, FluxDispatcher, showToast } from "@webpack/common";
 
 import { settings } from "../settings";
@@ -152,6 +152,13 @@ async function getActivity(): Promise<Activity | null> {
     };
 
     const getDetails = () => {
+        const season = mediaData.seasonNumber;
+        const episode = mediaData.episodeNumber;
+        if (mediaData.type === "Episode" && mediaData.seriesName)
+            return `${mediaData.seriesName} · S${season?.toString().padStart(2, "0") ?? "00"}E${episode?.toString().padStart(2, "0") ?? "00"}`;
+
+        return mediaData.name;
+        /*
         let details: string;
         if (mediaData.type === "Episode" && mediaData.seriesName)
             details = settings.store.jf_privacyMode ? "Watching a TV Show" : mediaData.seriesName;
@@ -159,9 +166,14 @@ async function getActivity(): Promise<Activity | null> {
             details = settings.store.jf_privacyMode ? "Watching Something" : mediaData.name;
         if (mediaData.isPaused) details += " - Paused";
         return details;
+        */
     };
 
     const getState = () => {
+        if (mediaData.type === "Episode" && mediaData.seriesName)
+            return mediaData.name;
+
+        /*
         let state: string | undefined;
 
         if (mediaData.type === "Episode" && mediaData.seriesName) {
@@ -205,6 +217,7 @@ async function getActivity(): Promise<Activity | null> {
             return parts.join(" - ") || "Paused";
         }
         return state;
+        */
     };
 
     const timestamps = (!mediaData.isPaused && mediaData.position != null && mediaData.duration != null) ? {
@@ -216,7 +229,8 @@ async function getActivity(): Promise<Activity | null> {
         application_id: APPLICATION_ID,
         name: appName,
         details: getDetails(),
-        state: getState() || "something",
+        state: getState(),
+        status_display_type: ActivityStatusDisplayType.DETAILS,
         assets,
         timestamps,
         type: richPresenceType,
