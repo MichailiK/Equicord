@@ -301,12 +301,18 @@ export const settings = definePluginSettings({
         default: true,
         hidden: true,
     },
+    nd_artistLink: {
+        description: "Link the state line to the artist on ListenBrainz.",
+        type: OptionType.BOOLEAN,
+        default: true,
+        hidden: true,
+    },
     nd_albumArtMode: {
         description: "How to fetch album art.",
         type: OptionType.SELECT,
         options: [
             { label: "None", value: "none", default: true },
-            { label: "Navidrome Instance (Exposes Server URL to Discord, no auth sent)", value: "instance" },
+            { label: "Cover Art Archive (Requires MusicBrainz tags)", value: "coverartarchive" },
             { label: "Last.fm API (Sends track metadata to Last.fm)", value: "lastfm" },
         ],
         hidden: true,

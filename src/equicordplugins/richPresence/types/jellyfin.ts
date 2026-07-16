@@ -10,10 +10,19 @@ export interface JfSession {
     PlayState?: {
         IsPaused?: boolean;
         PositionTicks?: number;
+        MediaSourceId?: string;
     };
 }
 
-interface JfNowPlayingItem {
+export interface JfMediaStream {
+    Type?: string;
+    Codec?: string;
+    Width?: number;
+    Height?: number;
+    VideoRangeType?: string;
+}
+
+export interface JfNowPlayingItem {
     Name?: string;
     Type?: string;
     Id?: string;
@@ -27,6 +36,10 @@ interface JfNowPlayingItem {
     ProductionYear?: number;
     RunTimeTicks?: number;
     ImageTags?: { Primary?: string; };
+    ProviderIds?: Record<string, string>;
+    Studios?: { Name?: string; }[];
+    MediaStreams?: JfMediaStream[];
+    MediaSources?: { Id?: string; MediaStreams?: JfMediaStream[]; }[];
 }
 
 export interface JfMediaData {
@@ -43,4 +56,10 @@ export interface JfMediaData {
     duration?: number;
     position?: number;
     isPaused?: boolean;
+    providerIds?: Record<string, string>;
+    seriesProviderIds?: Record<string, string>;
+    videoQuality?: string;
+    videoResolution?: string;
+    videoFormat?: string;
+    studio?: string;
 }

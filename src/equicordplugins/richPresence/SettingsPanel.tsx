@@ -193,7 +193,7 @@ function NavidromeSettings() {
             <TextSetting name="Client ID" description="Optional Discord Application Client ID." settingsKey="nd_clientId" placeholder="1470554657506984069" />
             <SelectSetting name="Album Art Mode" description="How to fetch album art." settingsKey="nd_albumArtMode" options={[
                 { label: "None", value: "none" },
-                { label: "Navidrome Instance (Exposes Server URL. One-time auth sent.)", value: "instance" },
+                { label: "Cover Art Archive (Requires MusicBrainz tags)", value: "coverartarchive" },
                 { label: "Last.fm API (Sends Metadata to last.fm)", value: "lastfm" },
             ]} />
             {nd_albumArtMode === "lastfm" && (
@@ -201,6 +201,7 @@ function NavidromeSettings() {
             )}
             <SwitchSetting name="Show Small Image" description="Show Navidrome logo in bottom right of album art." settingsKey="nd_showSmallImage" />
             <SwitchSetting name="Show Album" description="Show album name in presence." settingsKey="nd_showAlbum" />
+            <SwitchSetting name="Artist Link" description="Link the state line to the artist on ListenBrainz. Turn off if your state format doesn't show the artist." settingsKey="nd_artistLink" />
             <SelectSetting name="Activity Type" description="Which type of activity to display." settingsKey="nd_activityType" options={[
                 { label: "Listening", value: 2 },
                 { label: "Playing", value: 0 },

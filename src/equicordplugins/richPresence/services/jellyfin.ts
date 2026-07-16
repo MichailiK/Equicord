@@ -5,12 +5,13 @@
  */
 
 import { Logger } from "@utils/Logger";
-import { formatDurationMs } from "@utils/text";
-import { Activity } from "@vencord/discord-types";
+import { TTLMap } from "@utils/TTLMap";
+import { Activity, ActivityButton } from "@vencord/discord-types";
+import { ActivityStatusDisplayType } from "@vencord/discord-types/enums";
 import { ApplicationAssetUtils, FluxDispatcher, showToast } from "@webpack/common";
 
 import { settings } from "../settings";
-import { JfMediaData, JfSession } from "../types/jellyfin";
+import { JfMediaData, JfMediaStream, JfNowPlayingItem, JfSession } from "../types/jellyfin";
 
 const APPLICATION_ID = "1381368130164625469";
 const SOCKET_ID = "RichPresence_JF";
@@ -18,6 +19,39 @@ const logger = new Logger("RichPresence:Jellyfin");
 
 let updateInterval: NodeJS.Timeout | undefined;
 let hasShownError = false;
+const itemCache = new TTLMap<string, JfNowPlayingItem>(8 * 60 * 60 * 1000);
+
+async function fetchItem(baseUrl: string, itemId: string): Promise<JfNowPlayingItem | undefined> {
+    if (!itemCache.has(itemId)) {
+        const { jf_apiKey, jf_userId } = settings.store;
+        try {
+            const res = await fetch(`${baseUrl}/Items/${itemId}?userId=${jf_userId}`, {
+                headers: {
+                    "Accept": "application/json",
+                    "Authorization": `MediaBrowser Token="${jf_apiKey}"`
+                }
+            });
+            if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+            itemCache.set(itemId, await res.json());
+        } catch (e) {
+            logger.warn("Failed to fetch item details", e);
+        }
+    }
+    return itemCache.get(itemId);
+}
+
+function formatResolution(stream: JfMediaStream | undefined): string | undefined {
+    const { Width: w, Height: h } = stream ?? {};
+    return !w || !h ? undefined : w > 4096 ? "8K" : w > 2560 ? "4K" : w > 1280 ? "1080p" : w > 960 ? "720p" : `${h}p`;
+}
+
+function formatVideoFormat(stream: JfMediaStream | undefined): string | undefined {
+    if (!stream) return undefined;
+    const { Codec, VideoRangeType: range } = stream;
+    const rangeText = range === "Unknown" || range === "DOVIInvalid" ? undefined
+        : range?.startsWith("DOVI") ? "Dolby Vision" : range === "HDR10Plus" ? "HDR10+" : range;
+    return [Codec?.toUpperCase(), rangeText].filter(Boolean).join(" ") || undefined;
+}
 
 async function getAsset(key: string): Promise<string> {
     return (await ApplicationAssetUtils.fetchAssetIds(APPLICATION_ID, [key]))[0];
@@ -73,6 +107,12 @@ async function fetchMediaData(): Promise<JfMediaData | null> {
                 ? item.SeriesId : item.Id}/Images/Primary`
             : undefined;
 
+        const fullItem = (item.Type === "Movie" || item.Type === "Episode") && item.Id ? await fetchItem(baseUrl, item.Id) : undefined;
+        const streams = fullItem?.MediaSources?.find(s => s.Id === playState?.MediaSourceId)?.MediaStreams ?? fullItem?.MediaStreams;
+        const videoStream = streams?.find(s => s.Type === "Video");
+        const videoResolution = formatResolution(videoStream);
+        const videoFormat = formatVideoFormat(videoStream);
+
         return {
             name: item.Name || "Unknown",
             type: item.Type || "Unknown",
@@ -87,6 +127,13 @@ async function fetchMediaData(): Promise<JfMediaData | null> {
             duration: item.RunTimeTicks ? Math.floor(item.RunTimeTicks / 10000000) : undefined,
             position: playState?.PositionTicks ? Math.floor(playState.PositionTicks / 10000000) : undefined,
             isPaused: !!playState?.IsPaused,
+            providerIds: item.ProviderIds,
+            seriesProviderIds: item.Type === "Episode" && item.SeriesId
+                ? (await fetchItem(baseUrl, item.SeriesId))?.ProviderIds : undefined,
+            videoQuality: [videoResolution, videoFormat].filter(Boolean).join(" ") || undefined,
+            videoResolution,
+            videoFormat,
+            studio: item.Studios?.[0]?.Name,
         };
     } catch (e) {
         logger.error("Failed to query Jellyfin API", e);
@@ -113,7 +160,11 @@ async function getActivity(): Promise<Activity | null> {
             .replace(/\{episode\}/g, mediaData.episodeNumber?.toString() || "")
             .replace(/\{artist\}/g, mediaData.artist || "")
             .replace(/\{album\}/g, mediaData.album || "")
-            .replace(/\{year\}/g, mediaData.year?.toString() || "");
+            .replace(/\{year\}/g, mediaData.year?.toString() || "")
+            .replace(/\{studio\}/g, mediaData.studio || "")
+            .replace(/\{quality\}/g, mediaData.videoQuality || "")
+            .replace(/\{resolution\}/g, mediaData.videoResolution || "")
+            .replace(/\{format\}/g, mediaData.videoFormat || "");
 
     let appName: string;
     const nameSetting = settings.store.jf_nameDisplay || "default";
@@ -151,13 +202,47 @@ async function getActivity(): Promise<Activity | null> {
             break;
     }
 
+    let mainUrl: string | undefined;
+    let episodeUrl: string | undefined;
+    const buttons: ActivityButton[] = [];
+    if (!settings.store.jf_privacyMode) {
+        const ids = mediaData.providerIds ?? {};
+        const seriesIds = mediaData.seriesProviderIds ?? {};
+        const imdbUrl = (id?: string) => id ? `https://www.imdb.com/title/${id}/` : undefined;
+        let dbButton: ActivityButton | undefined;
+
+        if (mediaData.type === "Episode") {
+            mainUrl = imdbUrl(seriesIds.Imdb);
+            episodeUrl = imdbUrl(ids.Imdb);
+            const tvdbUrl = ids.Tvdb
+                ? `https://www.thetvdb.com/dereferrer/episode/${ids.Tvdb}`
+                : seriesIds.Tvdb ? `https://www.thetvdb.com/dereferrer/series/${seriesIds.Tvdb}` : undefined;
+            if (tvdbUrl) dbButton = { label: "Show on TheTVDB", url: tvdbUrl };
+        } else if (mediaData.type === "Movie") {
+            mainUrl = imdbUrl(ids.Imdb);
+            if (ids.Tmdb) dbButton = { label: "Show on The Movie DB", url: `https://www.themoviedb.org/movie/${ids.Tmdb}` };
+        }
+
+        const imdbButtonUrl = episodeUrl ?? mainUrl;
+        if (imdbButtonUrl) buttons.push({ label: "Show on IMDb", url: imdbButtonUrl });
+        if (dbButton) buttons.push(dbButton);
+    }
+
     const assets = {
         large_image: !settings.store.jf_privacyMode && mediaData.imageUrl
             ? await getAsset(mediaData.imageUrl) : undefined,
-        large_text: mediaData.seriesName || mediaData.album || undefined,
+        large_text: mediaData.seriesName || mediaData.album || (settings.store.jf_privacyMode ? undefined : mediaData.name),
+        large_url: mainUrl,
     };
 
     const getDetails = () => {
+        const season = mediaData.seasonNumber;
+        const episode = mediaData.episodeNumber;
+        if (mediaData.type === "Episode" && mediaData.seriesName)
+            return `${mediaData.seriesName} · S${season?.toString().padStart(2, "0") ?? "00"}E${episode?.toString().padStart(2, "0") ?? "00"}`;
+
+        return mediaData.name;
+        /*
         let details: string;
         if (mediaData.type === "Episode" && mediaData.seriesName)
             details = settings.store.jf_privacyMode ? "Watching a TV Show" : mediaData.seriesName;
@@ -165,9 +250,17 @@ async function getActivity(): Promise<Activity | null> {
             details = settings.store.jf_privacyMode ? "Watching Something" : mediaData.name;
         if (mediaData.isPaused) details += " - Paused";
         return details;
+        */
     };
 
     const getState = () => {
+        if (mediaData.type === "Episode" && mediaData.seriesName)
+            return mediaData.name;
+
+        if (mediaData.type === "Movie")
+            return [mediaData.year, mediaData.studio].filter(Boolean).join(" · ") || undefined;
+
+        /*
         let state: string | undefined;
 
         if (mediaData.type === "Episode" && mediaData.seriesName) {
@@ -211,6 +304,7 @@ async function getActivity(): Promise<Activity | null> {
             return parts.join(" - ") || "Paused";
         }
         return state;
+        */
     };
 
     const timestamps = (!mediaData.isPaused && mediaData.position != null && mediaData.duration != null) ? {
@@ -222,7 +316,12 @@ async function getActivity(): Promise<Activity | null> {
         application_id: APPLICATION_ID,
         name: appName,
         details: getDetails(),
-        state: getState() || "something",
+        details_url: mainUrl,
+        state: getState(),
+        state_url: episodeUrl,
+        buttons: buttons.length ? buttons.map(b => b.label) : undefined,
+        metadata: buttons.length ? { button_urls: buttons.map(b => b.url) } : undefined,
+        status_display_type: ActivityStatusDisplayType.DETAILS,
         assets,
         timestamps,
         type: richPresenceType,
@@ -248,5 +347,6 @@ export function start() {
 export function stop() {
     clearInterval(updateInterval);
     updateInterval = undefined;
+    itemCache.clear();
     setActivity(null);
 }

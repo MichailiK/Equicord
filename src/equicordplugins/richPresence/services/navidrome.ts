@@ -6,7 +6,9 @@
 
 import { Logger } from "@utils/Logger";
 import { parseUrl } from "@utils/misc";
-import { Activity } from "@vencord/discord-types";
+import { TTLMap } from "@utils/TTLMap";
+import { PluginNative } from "@utils/types";
+import { Activity, ActivityButton } from "@vencord/discord-types";
 import { ActivityFlags, ActivityStatusDisplayType } from "@vencord/discord-types/enums";
 import { ApplicationAssetUtils, FluxDispatcher } from "@webpack/common";
 import md5 from "md5";
@@ -19,6 +21,7 @@ function md5Hex(str: string): string {
 
 const SOCKET_ID = "RichPresence_Navidrome";
 const logger = new Logger("RichPresence:Navidrome");
+const Native = VencordNative.pluginHelpers.RichPresence as PluginNative<typeof import("../native")>;
 
 let updateTimer: NodeJS.Timeout | undefined;
 let abortController: AbortController | undefined;
@@ -30,18 +33,45 @@ let lastMinutesAgo: number | undefined;
 let cachedActivity: Activity | undefined;
 let cachedSettingsJSON: string | undefined;
 const lastFmCache = new Map<string, string | null>();
+const mbidCache = new TTLMap<string, string | null>(8 * 60 * 60 * 1000);
+const releaseCache = new TTLMap<string, MbRelease>(8 * 60 * 60 * 1000);
+
+interface MbRelease {
+    trackIds: Record<string, string>;
+    hasFrontCover: boolean;
+}
+
+const pendingReleases = new Set<string>();
+
+function getRelease(releaseMbid: string): MbRelease | undefined {
+    if (!releaseCache.has(releaseMbid) && !pendingReleases.has(releaseMbid)) {
+        pendingReleases.add(releaseMbid);
+        Native.fetchMusicBrainzRelease(releaseMbid).then(release => {
+            if (!release) return logger.warn("Failed to fetch release from MusicBrainz", releaseMbid);
+            releaseCache.set(releaseMbid, release);
+            cachedActivity = undefined;
+            restartUpdates();
+        }).finally(() => pendingReleases.delete(releaseMbid));
+    }
+    return releaseCache.get(releaseMbid);
+}
 
 interface NdTrack {
     id: string;
     title?: string;
     artist?: string;
+    artistId?: string;
+    artists?: { id: string; name: string; }[];
     album?: string;
+    albumId?: string;
+    musicBrainzId?: string;
     year?: number;
     suffix?: string;
+    bitDepth?: number;
     bitRate?: number;
+    samplingRate?: number;
     duration?: number;
     minutesAgo?: number;
-    coverArt?: string;
     username?: string;
     state?: string;
     positionMs?: number;
@@ -50,12 +80,26 @@ interface NdTrack {
 
 function customFormat(formatStr: string | undefined, track: NdTrack): string {
     if (!formatStr) return "";
+
+    const numberFmt = new Intl.NumberFormat("en-US", { maximumFractionDigits: 1 });
+    const qualityStrings: string[] = [];
+    if (track.suffix)
+        qualityStrings.push(track.suffix.toUpperCase());
+    if (track.bitDepth && track.samplingRate) {
+        qualityStrings.push(`${track.bitDepth.toFixed()}/${(numberFmt.format(track.samplingRate / 1000))}`);
+    }
+    if (track.bitRate) {
+        if (track.bitRate >= 2048)
+            qualityStrings.push(`${(track.bitRate / 1024).toFixed(1)} Mb/s`);
+        else
+            qualityStrings.push(`${track.bitRate} kb/s`);
+    }
     return formatStr
         .replaceAll("{song}", track.title ?? "")
-        .replaceAll("{artist}", track.artist ?? "")
+        .replaceAll("{artist}", track.artists?.[0]?.name ?? track.artist ?? "")
         .replaceAll("{album}", track.album ?? "")
         .replaceAll("{year}", track.year ? `${track.year}` : "")
-        .replaceAll("{quality}", track.suffix ? `${track.suffix.toUpperCase()}${track.bitRate ? " " + track.bitRate + "kbps" : ""}` : "");
+        .replaceAll("{quality}", qualityStrings.join(" · "));
 }
 
 async function getAsset(applicationId: string, key: string): Promise<string> {
@@ -105,13 +149,34 @@ async function fetchNowPlaying(signal?: AbortSignal): Promise<NdTrack | null> {
         const entries = data["subsonic-response"]?.nowPlaying?.entry;
         if (!entries || !Array.isArray(entries) || entries.length === 0) return null;
 
-        const myEntry = entries.find((e: NdTrack) => e.username?.toLowerCase() === nd_username.toLowerCase());
-        return myEntry ?? null;
+        const myEntries = entries.filter((e: NdTrack) => e.username?.toLowerCase() === nd_username.toLowerCase());
+        return myEntries.find((e: NdTrack) => e.state?.toLowerCase() === "playing") ?? myEntries[0] ?? null;
     } catch (e: unknown) {
         if (e instanceof Error && e.name === "AbortError") throw e;
         logger.error("Failed to fetch from Navidrome API", e);
         return null;
     }
+}
+
+async function fetchMbid(baseUrl: string, type: "album" | "artist", id: string, signal?: AbortSignal): Promise<string | undefined> {
+    const cacheKey = `${type}:${id}`;
+    if (!mbidCache.has(cacheKey)) {
+        const { nd_username, nd_password } = settings.store;
+        const salt = Math.random().toString(36).substring(2, 8);
+        const token = md5Hex((nd_password ?? "") + salt);
+        const endpoint = type === "album" ? "getAlbum" : "getArtist";
+
+        try {
+            const res = await fetch(`${baseUrl}/rest/${endpoint}?id=${encodeURIComponent(id)}&u=${encodeURIComponent(nd_username ?? "")}&t=${token}&s=${salt}&v=1.12.0&c=equicord-rpc&f=json`, { signal });
+            const json = await res.json();
+            mbidCache.set(cacheKey, json["subsonic-response"]?.[type]?.musicBrainzId || null);
+        } catch (e: unknown) {
+            if (e instanceof Error && e.name === "AbortError") throw e;
+            logger.warn(`Failed to fetch ${type} MBID from Navidrome`, e);
+            return undefined;
+        }
+    }
+    return mbidCache.get(cacheKey) ?? undefined;
 }
 
 function getSettingsJSON() {
@@ -130,6 +195,7 @@ function getSettingsJSON() {
         nd_albumArtMode: settings.store.nd_albumArtMode,
         nd_lastfmApiKey: settings.store.nd_lastfmApiKey,
         nd_showAlbum: settings.store.nd_showAlbum,
+        nd_artistLink: settings.store.nd_artistLink,
         nd_hideOnPause: settings.store.nd_hideOnPause
     });
 }
@@ -208,10 +274,6 @@ async function getActivity(signal?: AbortSignal): Promise<Activity | null> {
 
     const endTimestamp = cachedStartTimestamp + durationMs;
 
-    if (!isPaused && durationMs > 0 && Date.now() >= endTimestamp) {
-        return null;
-    }
-
     const isPlaying = Number(nd_activityType ?? 2) === 0;
     const nameString = !isPlaying ? customFormat(nd_nameString || "Navidrome", track) : "Navidrome";
 
@@ -234,14 +296,18 @@ async function getActivity(signal?: AbortSignal): Promise<Activity | null> {
         }
     }
 
+    const artistId = track.artists?.[0]?.id ?? track.artistId;
+    const [albumMbid, artistMbid] = externalBaseUrl ? await Promise.all([
+        track.albumId ? fetchMbid(externalBaseUrl, "album", track.albumId, signal) : undefined,
+        settings.store.nd_artistLink && artistId ? fetchMbid(externalBaseUrl, "artist", artistId, signal) : undefined,
+    ]) : [];
+    const release = albumMbid ? getRelease(albumMbid) : undefined;
+
     const albumArtMode = settings.store.nd_albumArtMode ?? "none";
     let resolvedCoverArtUrl: string | null = null;
 
-    if (albumArtMode === "instance" && track.coverArt && externalBaseUrl) {
-        const { nd_username, nd_password } = settings.store;
-        const salt = Math.random().toString(36).substring(2, 8);
-        const token = md5Hex((nd_password ?? "") + salt);
-        resolvedCoverArtUrl = `${externalBaseUrl}/rest/getCoverArt?id=${encodeURIComponent(track.coverArt)}&u=${encodeURIComponent(nd_username ?? "")}&t=${token}&s=${salt}&v=1.12.0&c=equicord-rpc`;
+    if (albumArtMode === "coverartarchive" && albumMbid && release?.hasFrontCover) {
+        resolvedCoverArtUrl = `https://coverartarchive.org/release/${albumMbid}/front-250`;
     } else if (albumArtMode === "lastfm" && track.artist) {
         const trimmedKey = nd_lastfmApiKey?.trim();
         const apiKey = trimmedKey || "feff915bf5987580c9dc354d523dc6b9";
@@ -328,6 +394,22 @@ async function getActivity(signal?: AbortSignal): Promise<Activity | null> {
         assets,
     };
 
+    if (track.musicBrainzId) activity.details_url = `https://listenbrainz.org/track/${track.musicBrainzId}`;
+    if (artistMbid) activity.state_url = `https://listenbrainz.org/artist/${artistMbid}`;
+    if (albumMbid) assets.large_url = `https://musicbrainz.org/release/${albumMbid}`;
+
+    const buttons: ActivityButton[] = [];
+    if (albumMbid) {
+        const trackMbid = track.musicBrainzId && release?.trackIds[track.musicBrainzId];
+        buttons.push({ label: "View Album on ListenBrainz", url: `https://listenbrainz.org/release/${albumMbid}` });
+        buttons.push({ label: "View on MusicBrainz", url: `https://musicbrainz.org/release/${albumMbid}${trackMbid ? `#${trackMbid}` : ""}` });
+    }
+
+    if (buttons.length) {
+        activity.buttons = buttons.map(b => b.label);
+        activity.metadata = { button_urls: buttons.map(b => b.url) };
+    }
+
     cachedSettingsJSON = currentSettingsJSON;
     cachedActivity = activity;
     cachedTrackState = track.state;
@@ -378,6 +460,10 @@ export function forceUpdate() {
         return;
     }
 
+    restartUpdates();
+}
+
+function restartUpdates() {
     if (abortController && !abortController.signal.aborted) {
         abortController.abort();
         clearTimeout(updateTimer);
@@ -391,6 +477,8 @@ export function stop() {
     abortController = undefined;
     clearTimeout(updateTimer);
     lastFmCache.clear();
+    mbidCache.clear();
+    releaseCache.clear();
     updateTimer = undefined;
     currentTrackId = undefined;
     cachedStartTimestamp = undefined;
